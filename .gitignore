@@ -7,3 +7,4 @@ ltx/
 keys/
 *.skey
 *.vkey
+__pycache__/

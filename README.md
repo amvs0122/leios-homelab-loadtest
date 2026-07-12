@@ -14,9 +14,11 @@ Two things are measured here, kept strictly separate:
 | | |
 |---|---|
 | Host | one container: 4 cores, 4 GB RAM, 30 GB disk |
-| Binary | `cardano-node 11.0.1.164` (special Leios build, release `prototype-2026w25`) |
+| Binary | `cardano-node 11.1.0.164` (special Leios build, release `prototype-2026w28`; originally measured on `prototype-2026w25`) |
 | Network magic | `164` |
 | Role | relay → block producer (registered a testnet pool via the faucet) |
+
+> ⚠️ The testnet gets **respun without notice** (new genesis, pool registration and funds wiped). If your node is stuck at a low slot with `NoCounterForKeyHashOCERT` errors, see [RESPIN.md](RESPIN.md) for the recovery runbook.
 
 ## Measuring throughput (passive)
 
@@ -43,6 +45,12 @@ Each endorser block carries a bitmap of which transactions it includes; a popcou
 
 - Largest single EB: **2,184 transactions** · tx/EB distribution p50 = 747, p90 = 2,184.
 - For comparison, Cardano mainnet (Praos) has only ever sustained ~12 TPS peak (theoretical ceiling ~18, real average < 1 — [Chainspect](https://chainspect.app/chain/cardano)).
+
+### The peaks are the protocol cap, not the network's limit (July update)
+
+Re-running the same measurements on the post-respin chain (`prototype-2026w28`, genesis 2026-07-01) produced **identical** short-window peaks: 218 TPS/10 s, 73 TPS/60 s, and the exact same largest EB — **2,184 tx / 78,627 bytes**. That is no coincidence: 2,184 × 36 B per tx reference = 78,624 B, i.e. a **full EB at the size cap**. The famous "218 TPS peak" is simply one maxed-out EB divided by a 10 s window.
+
+The number that actually matters is the implied sustained ceiling: one full EB per ~22 s EB interval ≈ **~96 TPS** with current parameters. Steady-state generator load on the testnet runs at ~20–25 TPS, so the observed chain never shows it — measuring it is what [`submit/submitter.py`](submit/submitter.py) is for.
 
 > **Bytes caveat:** `ebBytesSize` (~36 B/tx) is only the size of the tx *references* inside the EB, not the full payload (bodies are diffused separately in Leios). The **tx-count** TPS is the reliable metric; EB byte-throughput underestimates real data (~250 B/tx → 218 TPS ≈ ~55 KB/s).
 
@@ -76,11 +84,29 @@ Submitting from the pool's wallet to watch end-to-end batching and find the ceil
 
 To actually stress Leios you'd need a persistent submitter (not one `cardano-cli` fork per tx) or IOG's `tx-generator`. The network — Leios plus the testnet's pools — absorbs everything a home node can throw at it.
 
+## Sustained submitter (July update)
+
+[`submit/submitter.py`](submit/submitter.py) replaces the flood scripts for sustained-rate tests. Two problems it solves:
+
+1. **Funds**: a sustained 100+ TPS test needs tens of thousands of txs, but each 1-in-1-out tx only needs ~1.2 ADA if they're **chained** — each tx spends the previous one's change (the mempool accepts chained unconfirmed txs). K chains × depth D txs need only K funding UTxOs: 20 × 400 = 8,000 txs from 20 UTxOs.
+2. **Rate control**: pre-sign everything up front, then submit through a worker pool with a token bucket for an exact tx/s rate, retrying `BadInputsUTxO` (parent not yet propagated) with backoff — instead of blind parallelism that exhausts sockets.
+
+```bash
+python3 submitter.py fanout  --chains 20 --depth 400   # create 20 head UTxOs
+python3 submitter.py presign --chains 20 --depth 400   # sign 8,000 txs
+python3 submitter.py submit  --rate 150 --workers 20   # fire (raise ulimit -n)
+python3 submitter.py status                            # per-chain confirmation
+```
+
+Smoke-tested at low rate on w28 (exact rate held, 0 errors, chains confirmed end-to-end). The ~96 TPS ceiling run is pending — results will land here.
+
 ## Notes & gotchas
 
 - `consolidate.sh` matters: the fan-out assumes one large UTxO. Without consolidating first, funds fragment and the fan-out jams (`tx does not balance` / `AllInputsAreSpent`).
-- `calculate-min-fee` returns JSON `{"fee":N}` — parse with `jq -r .fee` and add a buffer.
+- `calculate-min-fee` returns JSON `{"fee":N}` — parse with `jq -r .fee`. And mind your draft: a `--tx-out ADDR+0` change placeholder encodes 8 CBOR bytes shorter than a real amount, so the computed fee comes up 8 × `minFeeA` lovelace short (`FeeTooSmallUTxO`). Use a realistic placeholder or add a buffer.
 - `stake-address` / `stake-pool` live under `cardano-cli latest …` (not top-level) in this build.
+- The faucet's `delegate` endpoint wants the pool id in **bech32** (`pool1…`); hex is rejected with `StringToDecodeTooShort`.
+- **Don't benchmark on release day.** Fleet upgrades masquerade as protocol regressions — we watched inclusion latency go from ~34 s to 4–30 min and back within hours of a release shipping (details in [RESPIN.md](RESPIN.md)).
 - Paths in the scripts (`/opt/leios/...`) are from my LXC layout — adjust `CARDANO_NODE_SOCKET_PATH`, key paths and `--testnet-magic` for yours.
 
 ## License
